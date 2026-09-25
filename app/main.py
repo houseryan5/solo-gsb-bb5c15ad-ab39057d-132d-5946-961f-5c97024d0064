@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档。"""
+"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档、纸质备用谱页序核对与纸质谱练习页签规划。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .planner import Plan, PlanningError, plan_pages
+from .practice_tabs import PracticeTabError, place_practice_tabs
 from .print_audit import PrintAuditError, audit_print_pages
 from .rehearsal import (
     Location,
@@ -511,6 +512,76 @@ class PrintAuditResponse(BaseModel):
     )
 
 
+# ---------------------------------------- 纸质谱练习页签规划
+
+
+class PracticeMeasureIn(BaseModel):
+    """一个常练小节及其查找权重。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    measure: int = Field(..., description="常练小节序号（0 基）")
+    weight: int = Field(..., description="该小节的查找权重（正整数）")
+
+    @field_validator("measure", "weight", mode="before")
+    @classmethod
+    def _reject_non_integer(cls, value: object) -> object:
+        """序号与权重必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会强转）与布尔。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"小节序号与查找权重必须为整数（收到 {value!r}）")
+        return value
+
+
+class PracticeTabsRequest(BaseModel):
+    """纸质谱练习页签规划请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    practice_measures: List[PracticeMeasureIn] = Field(
+        ...,
+        description="常练小节及各自查找权重（非空）；同一页上的多个小节"
+        "（含重复列出的同一小节）权重合并",
+    )
+    tab_count: int = Field(
+        ..., description="页签数 K：恰好贴 K 个，须在 1 到目标页数之间"
+    )
+
+    @field_validator("tab_count", mode="before")
+    @classmethod
+    def _reject_non_integer_tab_count(cls, value: object) -> object:
+        """页签数必须是严格整数：拒绝浮点与布尔。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"页签数必须为整数（收到 {value!r}）")
+        return value
+
+
+class PracticeTabTargetOut(BaseModel):
+    """一个目标页的查找结果。"""
+
+    page_index: int = Field(..., description="目标页页码（1 基）")
+    weight: int = Field(..., description="该页合并后的查找权重")
+    nearest_tab: int = Field(
+        ..., description="最近页签页码（距离并列取较小页码）"
+    )
+    distance: int = Field(..., description="到最近页签的页码距离")
+
+
+class PracticeTabsResponse(BaseModel):
+    id: str
+    request: PracticeTabsRequest
+    page_count: int = Field(..., description="规划页数")
+    target_page_count: int = Field(..., description="有练习目标的页数（同页合并后）")
+    tabs: List[int] = Field(
+        ..., description="页签页码（1 基，升序，恰好 tab_count 个）"
+    )
+    total_cost: int = Field(
+        ..., description="最小总代价（各目标页权重 × 到最近页签页码距离之和）"
+    )
+    targets: List[PracticeTabTargetOut] = Field(
+        ..., description="每个目标页的最近页签（按页码升序）"
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -745,6 +816,51 @@ def audit_plan_print_pages(
             )
             for step in result.steps
         ],
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/practice-tabs",
+    response_model=PracticeTabsResponse,
+)
+def plan_practice_tabs(
+    plan_id: str, payload: PracticeTabsRequest
+) -> PracticeTabsResponse:
+    """为已保存方案规划纸质谱练习页签。
+
+    把常练小节按方案分页映射到目标页（同页权重合并），在**有练习目标的页**
+    上贴恰好 K 个页签：每个目标页从最近页签开始查找，代价为页码距离乘该页
+    权重，全局最小化总代价；同代价按升序页签列表字典序取最小。返回页签页码、
+    总代价及每个目标页的最近页签（距离并列取较小页码）。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_request = PlanRequest(**record["request"])
+    plan_result = PlanResult(**record["result"])
+    page_starts = [p.start_measure for p in plan_result.pages]
+
+    try:
+        layout = place_practice_tabs(
+            measure_count=len(plan_request.measure_heights),
+            page_starts=page_starts,
+            practice=[(m.measure, m.weight) for m in payload.practice_measures],
+            tab_count=payload.tab_count,
+        )
+    except PracticeTabError as exc:
+        # 空目标 / 小节越界 / 权重或页签数非法 / 条数或目标页数超限：语义错误，明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return PracticeTabsResponse(
+        id=record["id"],
+        request=payload,
+        page_count=plan_result.page_count,
+        target_page_count=len(layout.targets),
+        tabs=layout.tabs,
+        total_cost=layout.total_cost,
+        targets=[PracticeTabTargetOut(**vars(t)) for t in layout.targets],
     )
 
 
